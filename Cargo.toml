@@ -5,6 +5,7 @@ members = [
     "crates/prime-store",
     "crates/prime-verify",
     "crates/prime-cli",
+    "crates/prime-app",
 ]
 
 [workspace.package]

@@ -9,17 +9,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          # The GUI crate is Windows-only; Linux builds and tests the engine crates.
+          - os: ubuntu-latest
+            scope: --workspace --exclude prime-app
+          - os: windows-latest
+            scope: --workspace
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo build --workspace --all-targets
-      - run: cargo test --workspace
-      - run: cargo clippy --workspace --all-targets
-      # First run generates Cargo.lock. Download it, commit it, then add --locked above.
+      - run: cargo build ${{ matrix.scope }} --all-targets
+      - run: cargo test ${{ matrix.scope }}
+      - run: cargo clippy ${{ matrix.scope }} --all-targets
+      # Dependencies changed (GUI added). Download the new Cargo.lock, commit it, then add --locked above.
       - uses: actions/upload-artifact@v4
         if: matrix.os == 'ubuntu-latest'
         with:
@@ -32,11 +37,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release -p prime-cli
+      - run: cargo build --release -p prime-cli -p prime-app
       - uses: actions/upload-artifact@v4
         with:
           name: prime-windows
-          path: target/release/prime.exe
+          path: |
+            target/release/prime.exe
+            target/release/primeledger.exe
 
   audit:
     runs-on: ubuntu-latest
