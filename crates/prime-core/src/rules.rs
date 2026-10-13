@@ -3,10 +3,12 @@
 //!
 //! One rule per line; `#` starts a comment:
 //!
-//!     max-amount GBP 500000     no single posting above 500000 minor units in that currency
-//!     freeze acct:suspended     no new transaction or hold may touch this account
-//!     require-memo              every transaction/hold needs a non-empty memo
-//!     max-postings 10           at most this many postings per transaction/hold
+//! ```text
+//! max-amount GBP 500000     no single posting above 500000 minor units in that currency
+//! freeze acct:suspended     no new transaction or hold may touch this account
+//! require-memo              every transaction/hold needs a non-empty memo
+//! max-postings 10           at most this many postings per transaction/hold
+//! ```
 //!
 //! Rules are checks only (they never rewrite a transaction). They apply to new transactions and
 //! holds; reversals and the settlement/void of an existing hold bypass them so mistakes can
