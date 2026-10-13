@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=PrimeLedger
+Comment=Append-only double-entry ledger
+Exec=primeledger
+Icon=primeledger
+Terminal=false
+Categories=Office;Finance;

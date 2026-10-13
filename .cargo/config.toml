@@ -1,0 +1,6 @@
+# Statically link the MSVC C runtime so primeledger.exe has no dependency on
+# VCRUNTIME140.dll / the VC++ redistributable. A clean Store certification
+# image (or a fresh user PC) may not have it, and a missing DLL at load time
+# is exactly the "error displayed at launch" failure mode.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -10,21 +11,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The GUI crate is Windows-only; Linux builds and tests the engine crates.
           - os: ubuntu-latest
-            scope: --workspace --exclude prime-app
+            scope: --workspace
           - os: windows-latest
             scope: --workspace
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install Linux GUI build dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libx11-dev libxcb1-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dev libegl1-mesa-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - run: cargo build ${{ matrix.scope }} --all-targets
       - run: cargo test ${{ matrix.scope }}
       - run: cargo clippy ${{ matrix.scope }} --all-targets
-      # Dependencies changed (GUI added). Download the new Cargo.lock, commit it, then add --locked above.
+      # Commit Cargo.lock, then add --locked to the cargo commands above.
       - uses: actions/upload-artifact@v4
         if: matrix.os == 'ubuntu-latest'
         with:
@@ -34,16 +40,87 @@ jobs:
   release-windows:
     needs: test
     runs-on: windows-latest
+    env:
+      # Repo variables (Settings > Secrets and variables > Actions > Variables).
+      # Defaults are the Partner Center values for PrimeLedger.
+      APPX_IDENTITY_NAME: ${{ vars.APPX_IDENTITY_NAME || 'TMHP.com.PrimeLedger' }}
+      APPX_PUBLISHER: ${{ vars.APPX_PUBLISHER || 'CN=BB6CF6A1-F89B-484C-85F4-1A7E35694B74' }}
+      APPX_PUBLISHER_DISPLAY_NAME: ${{ vars.APPX_PUBLISHER_DISPLAY_NAME || '@TMHP.com' }}
+      # Same secret names as your Electron repos: CSC_LINK = base64 .pfx, CSC_KEY_PASSWORD = its password.
+      CSC_LINK: ${{ secrets.CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
       - run: cargo build --release -p prime-cli -p prime-app
+
       - uses: actions/upload-artifact@v4
         with:
           name: prime-windows
           path: |
             target/release/prime.exe
             target/release/primeledger.exe
+
+      - name: Build Store .appxbundle (unsigned, for Partner Center)
+        shell: pwsh
+        run: |
+          .\packaging\appx\build-appx.ps1 `
+            -IdentityName $env:APPX_IDENTITY_NAME `
+            -Publisher $env:APPX_PUBLISHER `
+            -PublisherDisplayName $env:APPX_PUBLISHER_DISPLAY_NAME `
+            -Version "0.1.${{ github.run_number }}.0" `
+            -Out dist\PrimeLedger-store.appxbundle
+
+      - name: Build signed sideload .appxbundle (dev cert)
+        if: env.CSC_LINK != ''
+        shell: pwsh
+        run: |
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\cert.pfx", [Convert]::FromBase64String($env:CSC_LINK))
+          try {
+            .\packaging\appx\build-appx.ps1 `
+              -IdentityName $env:APPX_IDENTITY_NAME `
+              -PublisherDisplayName $env:APPX_PUBLISHER_DISPLAY_NAME `
+              -Version "0.1.${{ github.run_number }}.0" `
+              -Out dist\PrimeLedger-sideload.appxbundle `
+              -PfxPath "$env:RUNNER_TEMP\cert.pfx" -PfxPassword $env:CSC_KEY_PASSWORD
+          } finally {
+            Remove-Item "$env:RUNNER_TEMP\cert.pfx" -ErrorAction SilentlyContinue
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PrimeLedger-appxbundle
+          path: dist/*.appxbundle
+          if-no-files-found: error
+
+  release-linux:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libx11-dev libxcb1-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dev libegl1-mesa-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p prime-cli -p prime-app
+      - name: Package (.tar.gz)
+        run: |
+          D=dist/primeledger-linux
+          mkdir -p "$D"
+          cp target/release/primeledger target/release/prime "$D/"
+          cp packaging/linux/primeledger.png packaging/linux/primeledger.desktop packaging/linux/install.sh "$D/"
+          chmod +x "$D/primeledger" "$D/prime" "$D/install.sh"
+          tar -czf dist/PrimeLedger-linux-x86_64.tar.gz -C dist primeledger-linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PrimeLedger-linux
+          path: dist/PrimeLedger-linux-x86_64.tar.gz
+          if-no-files-found: error
 
   audit:
     runs-on: ubuntu-latest
