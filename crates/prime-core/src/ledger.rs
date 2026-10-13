@@ -2,7 +2,8 @@
 //!
 //! The same `apply` path is used when writing new records and when replaying a file,
 //! so a record that cannot be written cannot be replayed either.
-use crate::hash::Hash;
+use crate::codec::{CodecError, Decoder, Encoder};
+use crate::hash::{sha256, Hash};
 use crate::record::*;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -355,6 +356,156 @@ impl Ledger {
     }
 }
 
+const SNAP_MAGIC: &[u8] = b"PRIMESNAP1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotError {
+    BadMagic,
+    BadChecksum,
+    Codec(CodecError),
+}
+
+impl fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SnapshotError::BadMagic => write!(f, "not a PrimeLedger snapshot"),
+            SnapshotError::BadChecksum => write!(f, "snapshot checksum mismatch"),
+            SnapshotError::Codec(e) => write!(f, "snapshot undecodable: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
+
+impl From<CodecError> for SnapshotError {
+    fn from(e: CodecError) -> Self {
+        SnapshotError::Codec(e)
+    }
+}
+
+/// Snapshots are a *cache* of the state at some sequence number, used to skip replaying old
+/// records. They are never the source of truth: `prime-verify` ignores them, and the store only
+/// uses one if its head hash matches the record at that sequence number in the log.
+impl Ledger {
+    /// Deterministic encoding of the full state (same state => same bytes).
+    pub fn snapshot_bytes(&self) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.u64(self.last_seq);
+        e.raw(&self.last_hash.0);
+        e.i64(self.last_ms);
+        e.u32(self.accounts.len() as u32);
+        for (name, a) in &self.accounts {
+            e.str(name);
+            e.raw(&a.currency.0);
+            match a.floor {
+                Some(f) => {
+                    e.u8(1);
+                    e.i64(f);
+                }
+                None => e.u8(0),
+            }
+            e.i64(a.balance);
+        }
+        let mut keys: Vec<(&String, &u64)> = self.keys.iter().collect();
+        keys.sort();
+        e.u32(keys.len() as u32);
+        for (k, seq) in keys {
+            e.str(k);
+            e.u64(*seq);
+        }
+        e.u32(self.txs.len() as u32);
+        for (seq, t) in &self.txs {
+            e.u64(*seq);
+            e.u8(t.is_reversal as u8);
+            e.u8(t.reversed as u8);
+            e.u32(t.postings.len() as u32);
+            for p in &t.postings {
+                e.str(&p.account);
+                e.i64(p.amount);
+            }
+        }
+        let body = e.finish();
+        let sum = sha256(&[SNAP_MAGIC, body.as_slice()]);
+        let mut out = Vec::with_capacity(SNAP_MAGIC.len() + body.len() + 32);
+        out.extend_from_slice(SNAP_MAGIC);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&sum.0);
+        out
+    }
+
+    pub fn from_snapshot(bytes: &[u8]) -> Result<Ledger, SnapshotError> {
+        let m = SNAP_MAGIC.len();
+        if bytes.len() < m + 32 || &bytes[..m] != SNAP_MAGIC {
+            return Err(SnapshotError::BadMagic);
+        }
+        let (head, trailer) = bytes.split_at(bytes.len() - 32);
+        let body = &head[m..];
+        let want = sha256(&[SNAP_MAGIC, body]);
+        if want.0[..] != trailer[..] {
+            return Err(SnapshotError::BadChecksum);
+        }
+        let mut d = Decoder::new(body);
+        let last_seq = d.u64()?;
+        let last_hash = Hash(d.array::<32>()?);
+        let last_ms = d.i64()?;
+
+        let mut accounts = BTreeMap::new();
+        let n_accounts = d.u32()?;
+        for _ in 0..n_accounts {
+            let name = d.string(MAX_ACCOUNT_LEN)?;
+            let currency = Currency(d.array::<3>()?);
+            let floor = if d.flag()? { Some(d.i64()?) } else { None };
+            let balance = d.i64()?;
+            accounts.insert(
+                name,
+                AccountState {
+                    currency,
+                    floor,
+                    balance,
+                },
+            );
+        }
+        let mut keys = HashMap::new();
+        let n_keys = d.u32()?;
+        for _ in 0..n_keys {
+            let k = d.string(MAX_KEY_LEN)?;
+            let seq = d.u64()?;
+            keys.insert(k, seq);
+        }
+        let mut txs = BTreeMap::new();
+        let n_txs = d.u32()?;
+        for _ in 0..n_txs {
+            let seq = d.u64()?;
+            let is_reversal = d.flag()?;
+            let reversed = d.flag()?;
+            let n = d.u32()?;
+            let mut postings = Vec::new();
+            for _ in 0..n {
+                let account = d.string(MAX_ACCOUNT_LEN)?;
+                let amount = d.i64()?;
+                postings.push(Posting { account, amount });
+            }
+            txs.insert(
+                seq,
+                TxState {
+                    postings,
+                    is_reversal,
+                    reversed,
+                },
+            );
+        }
+        d.finish()?;
+        Ok(Ledger {
+            accounts,
+            keys,
+            txs,
+            last_seq,
+            last_hash,
+            last_ms,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,5 +681,38 @@ mod tests {
             },
         );
         assert_eq!(l.apply(&bad), Err(LedgerError::InvalidFloor));
+    }
+
+    #[test]
+    fn snapshot_roundtrip_is_exact_and_deterministic() {
+        let mut l = setup();
+        let t = post(&mut l, "k1", &[("equity", -100), ("a", 100)], None).unwrap();
+        post(&mut l, "k2", &[("equity", 100), ("a", -100)], Some(t.seq)).unwrap();
+        post(&mut l, "k3", &[("equity", -9), ("b", 9)], None).unwrap();
+        let bytes = l.snapshot_bytes();
+        let mut l2 = Ledger::from_snapshot(&bytes).unwrap();
+        assert_eq!(l2.snapshot_bytes(), bytes);
+        assert_eq!(l2.accounts(), l.accounts());
+        assert_eq!(l2.head_hash(), l.head_hash());
+        assert_eq!(l2.last_seq(), l.last_seq());
+        assert_eq!(l2.find_idempotent("k3"), l.find_idempotent("k3"));
+        // Restored state keeps enforcing the same rules.
+        assert!(matches!(
+            post(&mut l2, "k4", &[("equity", 100), ("a", -100)], Some(t.seq)),
+            Err(LedgerError::AlreadyReversed(_))
+        ));
+        let r = post(&mut l2, "k5", &[("equity", -1), ("b", 1)], None).unwrap();
+        assert_eq!(r.seq, l.last_seq() + 1);
+    }
+
+    #[test]
+    fn damaged_snapshot_rejected() {
+        let l = setup();
+        let mut bytes = l.snapshot_bytes();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0x01;
+        assert!(Ledger::from_snapshot(&bytes).is_err());
+        assert!(Ledger::from_snapshot(b"nope").is_err());
+        assert!(Ledger::from_snapshot(&[]).is_err());
     }
 }

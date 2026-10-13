@@ -1,7 +1,8 @@
 //! `prime`: command-line front end for PrimeLedger.
 #![forbid(unsafe_code)]
 
-use prime_core::merkle;
+use prime_core::query::{self, AsOf};
+use prime_core::{fx, merkle};
 use prime_core::{Currency, Hash, Posting, Record, RecordKind};
 use prime_store::{Book, BookError};
 use prime_core::LedgerError;
@@ -15,7 +16,9 @@ USAGE:
   prime open-account <file> <ACCOUNT> <CUR> [--floor <minor-units<=0>]
   prime post         <file> <idempotency-key> <memo> <ACCOUNT=AMOUNT>...
   prime reverse      <file> <seq> <idempotency-key>
-  prime balances     <file>
+  prime balances     <file> [--recorded-at YYYY-MM-DD] [--effective-at YYYY-MM-DD]
+  prime fx           <file> <key> <memo> <from> <fx-from> <fx-to> <to> <from-amt> <to-amt>
+  prime snapshot     <file>
   prime verify       <file>
   prime roots        <file>
   prime proof        <file> <seq>
@@ -52,6 +55,8 @@ fn run(args: &[String]) -> Result<(), String> {
         "post" => cmd_post(rest),
         "reverse" => cmd_reverse(rest),
         "balances" => cmd_balances(rest),
+        "fx" => cmd_fx(rest),
+        "snapshot" => cmd_snapshot(rest),
         "verify" => cmd_verify(rest),
         "roots" => cmd_roots(rest),
         "proof" => cmd_proof(rest),
@@ -176,14 +181,114 @@ fn cmd_reverse(a: &[String]) -> Result<(), String> {
     submit_tx(&mut book, &a[2], &format!("reversal of #{seq}"), Some(seq), postings)
 }
 
+fn print_rows(rows: &[(String, Currency, i64)]) {
+    for (name, cur, bal) in rows {
+        println!("{name:<32} {cur} {bal:>16}");
+    }
+}
+
+fn bad_date(s: &str) -> String {
+    format!("date '{s}' must look like YYYY-MM-DD")
+}
+
+/// Last millisecond of the given UTC day, so `--effective-at 2026-03-03` includes all of 3 March.
+fn parse_date_end_ms(s: &str) -> Result<i64, String> {
+    let mut it = s.split('-');
+    let y: i64 = it
+        .next()
+        .and_then(|x| x.parse().ok())
+        .ok_or_else(|| bad_date(s))?;
+    let m: u32 = it
+        .next()
+        .and_then(|x| x.parse().ok())
+        .ok_or_else(|| bad_date(s))?;
+    let d: u32 = it
+        .next()
+        .and_then(|x| x.parse().ok())
+        .ok_or_else(|| bad_date(s))?;
+    if it.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return Err(bad_date(s));
+    }
+    Ok((days_from_civil(y, m, d) + 1) * merkle::MS_PER_DAY - 1)
+}
+
+/// (year, month, day) to days since 1970-01-01, proleptic Gregorian.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (m as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 fn cmd_balances(a: &[String]) -> Result<(), String> {
+    if a.is_empty() {
+        return Err(usage());
+    }
+    let mut recorded = None;
+    let mut effective = None;
+    let mut i = 1;
+    while i < a.len() {
+        match a[i].as_str() {
+            "--recorded-at" => {
+                let v = a.get(i + 1).ok_or("--recorded-at needs a date")?;
+                recorded = Some(parse_date_end_ms(v)?);
+                i += 2;
+            }
+            "--effective-at" => {
+                let v = a.get(i + 1).ok_or("--effective-at needs a date")?;
+                effective = Some(parse_date_end_ms(v)?);
+                i += 2;
+            }
+            other => return Err(format!("unexpected argument '{other}'")),
+        }
+    }
+    if recorded.is_none() && effective.is_none() {
+        let book = open_book(&a[0])?;
+        print_rows(&book.ledger().accounts());
+        return Ok(());
+    }
+    // Historical views are computed from the verified log itself, never from a snapshot.
+    prime_verify::verify_file(Path::new(&a[0])).map_err(|e| format!("VERIFY FAILED: {e}"))?;
+    let data = std::fs::read(&a[0]).map_err(|e| e.to_string())?;
+    let sc = prime_store::scan(&data).map_err(|e| e.to_string())?;
+    let rows = query::balances_as_of(
+        &sc.records,
+        AsOf {
+            recorded_ms: recorded,
+            effective_ms: effective,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    print_rows(&rows);
+    Ok(())
+}
+
+fn cmd_fx(a: &[String]) -> Result<(), String> {
+    if a.len() != 9 {
+        return Err(usage());
+    }
+    let from_amt: i64 = a[7]
+        .parse()
+        .map_err(|_| "from-amt must be an integer".to_string())?;
+    let to_amt: i64 = a[8]
+        .parse()
+        .map_err(|_| "to-amt must be an integer".to_string())?;
+    let postings =
+        fx::exchange(&a[3], &a[4], &a[5], &a[6], from_amt, to_amt).map_err(|e| e.to_string())?;
+    let mut book = open_book(&a[0])?;
+    submit_tx(&mut book, &a[1], &a[2], None, postings)
+}
+
+fn cmd_snapshot(a: &[String]) -> Result<(), String> {
     if a.len() != 1 {
         return Err(usage());
     }
     let book = open_book(&a[0])?;
-    for (name, cur, bal) in book.ledger().accounts() {
-        println!("{name:<32} {cur} {bal:>16}");
-    }
+    book.write_snapshot().map_err(|e| e.to_string())?;
+    println!("snapshot written at #{}", book.ledger().last_seq());
     Ok(())
 }
 
@@ -272,13 +377,27 @@ fn cmd_proof(a: &[String]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::civil_from_days;
+    use super::{civil_from_days, days_from_civil, parse_date_end_ms};
 
     #[test]
     fn dates() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(19_723), (2024, 1, 1));
         assert_eq!(civil_from_days(-1), (1969, 12, 31));
+    }
+
+    #[test]
+    fn date_roundtrip_and_parsing() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2024, 1, 1), 19_723);
+        for z in [-800_000i64, -1, 0, 59, 60, 11_016, 19_723, 20_000, 800_000] {
+            let (y, m, d) = civil_from_days(z);
+            assert_eq!(days_from_civil(y, m, d), z);
+        }
+        assert_eq!(parse_date_end_ms("1970-01-01").unwrap(), 86_399_999);
+        assert!(parse_date_end_ms("2024-13-01").is_err());
+        assert!(parse_date_end_ms("2024-01").is_err());
+        assert!(parse_date_end_ms("x").is_err());
     }
 
     #[test]

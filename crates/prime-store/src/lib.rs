@@ -11,7 +11,7 @@ use prime_core::{sha256, Ledger, LedgerError, Record, RecordKind};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const MAGIC: &[u8; 8] = b"PRIMELDG";
 pub const MAX_FRAME: usize = 1 << 20;
@@ -226,25 +226,56 @@ impl From<LedgerError> for BookError {
     }
 }
 
+/// Write a snapshot automatically every this many records (0 disables).
+pub const SNAPSHOT_EVERY: u64 = 1000;
+
+fn snapshot_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".snap");
+    PathBuf::from(s)
+}
+
 /// An open ledger: engine state plus its file. Single writer.
 pub struct Book {
     ledger: Ledger,
     store: Store,
+    path: PathBuf,
     recovered_torn_tail: bool,
+    snapshot_every: u64,
 }
 
 impl Book {
-    /// Open or create, replaying (and re-validating) every record in the file.
+    /// Open or create. If a snapshot exists and its head hash matches the record at the same
+    /// sequence number in the log, only the records after it are replayed; otherwise (missing,
+    /// damaged, or from a different history) everything is replayed from the start.
     pub fn open(path: &Path) -> Result<Book, BookError> {
         let (store, sc) = Store::open(path)?;
-        let mut ledger = Ledger::new();
-        for rec in &sc.records {
+
+        let mut start = 0usize;
+        let mut restored: Option<Ledger> = None;
+        if let Ok(bytes) = std::fs::read(snapshot_path(path)) {
+            if let Ok(l) = Ledger::from_snapshot(&bytes) {
+                let n = l.last_seq() as usize;
+                if n >= 1
+                    && n <= sc.records.len()
+                    && sc.records[n - 1].seq == l.last_seq()
+                    && sc.records[n - 1].hash() == l.head_hash()
+                {
+                    start = n;
+                    restored = Some(l);
+                }
+            }
+        }
+        let mut ledger = restored.unwrap_or_default();
+        for rec in &sc.records[start..] {
             ledger.apply(rec)?;
         }
         Ok(Book {
             ledger,
             store,
+            path: path.to_path_buf(),
             recovered_torn_tail: sc.torn_tail,
+            snapshot_every: SNAPSHOT_EVERY,
         })
     }
 
@@ -257,12 +288,35 @@ impl Book {
         self.recovered_torn_tail
     }
 
+    pub fn set_snapshot_interval(&mut self, every: u64) {
+        self.snapshot_every = every;
+    }
+
+    /// Atomically write `<ledger file>.snap` (temp file, fsync, rename).
+    pub fn write_snapshot(&self) -> Result<(), StoreError> {
+        let snap = snapshot_path(&self.path);
+        let mut tmp = snap.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(&self.ledger.snapshot_bytes())?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &snap)?;
+        Ok(())
+    }
+
     /// Validate, write durably, then apply. Returns the record that was appended.
     pub fn submit(&mut self, kind: RecordKind, now_ms: i64) -> Result<Record, BookError> {
         let rec = self.ledger.next_record(now_ms, kind);
         self.ledger.check(&rec)?;
         self.store.append(&rec)?;
         self.ledger.apply(&rec)?;
+        if self.snapshot_every > 0 && rec.seq % self.snapshot_every == 0 {
+            // A snapshot is only a cache; failing to write one must not fail the transaction.
+            let _ = self.write_snapshot();
+        }
         Ok(rec)
     }
 }
@@ -276,6 +330,7 @@ mod tests {
     fn temp_path(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("primeledger-{}-{}.pld", std::process::id(), name));
         let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(snapshot_path(&p));
         p
     }
 
@@ -370,5 +425,76 @@ mod tests {
     #[test]
     fn bad_magic_rejected() {
         assert!(matches!(scan(b"NOTALEDGERFILE!"), Err(StoreError::BadMagic)));
+    }
+
+    #[test]
+    fn snapshot_fast_path_matches_full_replay() {
+        let p = temp_path("snapfast");
+        build(&p);
+        let mut b = Book::open(&p).unwrap();
+        b.write_snapshot().unwrap();
+        b.submit(transfer("k3", "a", "b", 10), 3000).unwrap();
+        drop(b);
+
+        let b = Book::open(&p).unwrap(); // uses the snapshot, replays 1 record
+        let head = b.ledger().head_hash();
+        let accts = b.ledger().accounts();
+        assert_eq!(b.ledger().last_seq(), 5);
+        drop(b);
+
+        let (_s, sc) = Store::open(&p).unwrap();
+        let mut full = Ledger::new();
+        for r in &sc.records {
+            full.apply(r).unwrap();
+        }
+        assert_eq!(full.head_hash(), head);
+        assert_eq!(full.accounts(), accts);
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(snapshot_path(&p));
+    }
+
+    #[test]
+    fn garbage_or_foreign_snapshot_is_ignored() {
+        let p1 = temp_path("snapforeign1");
+        let p2 = temp_path("snapforeign2");
+        build(&p1); // b ends at 200
+        Book::open(&p1).unwrap().write_snapshot().unwrap();
+
+        // A different history with the same number of records.
+        let mut b2 = Book::open(&p2).unwrap();
+        b2.submit(open_acct("a"), 1000).unwrap();
+        b2.submit(open_acct("b"), 1001).unwrap();
+        b2.submit(transfer("k1", "a", "b", 999), 1002).unwrap();
+        b2.submit(transfer("k2", "b", "a", 1), 1003).unwrap();
+        drop(b2);
+
+        std::fs::copy(snapshot_path(&p1), snapshot_path(&p2)).unwrap();
+        let b = Book::open(&p2).unwrap();
+        assert_eq!(b.ledger().account("b").unwrap().1, 998);
+        drop(b);
+
+        std::fs::write(snapshot_path(&p2), b"garbage").unwrap();
+        let b = Book::open(&p2).unwrap();
+        assert_eq!(b.ledger().account("b").unwrap().1, 998);
+        drop(b);
+
+        for p in [&p1, &p2] {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(snapshot_path(p));
+        }
+    }
+
+    #[test]
+    fn automatic_snapshot_interval() {
+        let p = temp_path("snapauto");
+        let mut b = Book::open(&p).unwrap();
+        b.set_snapshot_interval(2);
+        b.submit(open_acct("a"), 1).unwrap();
+        assert!(!snapshot_path(&p).exists());
+        b.submit(open_acct("b"), 2).unwrap();
+        assert!(snapshot_path(&p).exists());
+        drop(b);
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(snapshot_path(&p));
     }
 }

@@ -53,3 +53,22 @@ Leaves are record hashes grouped by UTC day of `recorded_ms`.
 An odd last node is promoted, not duplicated. Empty set = SHA-256("PRIMELEDGER/merkle/empty").
 Inclusion proofs are the sibling path with a side flag. Publish `prime roots` output externally
 to make rewrites detectable even by the machine's own admin.
+
+## Bitemporal queries
+
+`recorded_ms` (when written) and a transaction's `effective_ms` (when it happened) are independent
+clocks. `balances_as_of` can filter on either or both; account openings follow recorded time only.
+
+## FX
+
+Cross-currency movement is four postings through two explicit pool accounts (one per currency), so
+each currency still sums to zero. See `prime_core::fx::exchange`.
+
+## Snapshot (`<ledger file>.snap`, cache only)
+
+    "PRIMESNAP1" | body | SHA-256("PRIMESNAP1" || body)
+    body: u64 seq | [32] head_hash | i64 last_ms | accounts | idempotency keys | transactions
+
+Deterministic: the same state yields the same bytes. On open, a snapshot is used only if the log's
+record at `seq` hashes to `head_hash`; the remaining records are replayed through the normal rules.
+Written atomically (temp file, fsync, rename) every 1000 records or via `prime snapshot`.
