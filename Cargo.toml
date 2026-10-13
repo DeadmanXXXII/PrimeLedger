@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/prime-core",
+    "crates/prime-store",
+    "crates/prime-verify",
+    "crates/prime-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+sha2 = "0.10"
+prime-core = { path = "crates/prime-core" }
+prime-store = { path = "crates/prime-store" }
+prime-verify = { path = "crates/prime-verify" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+overflow-checks = true

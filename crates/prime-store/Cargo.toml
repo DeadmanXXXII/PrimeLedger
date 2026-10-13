@@ -1,0 +1,10 @@
+[package]
+name = "prime-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+prime-core.workspace = true
+sha2.workspace = true
