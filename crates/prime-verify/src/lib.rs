@@ -6,9 +6,9 @@
 #![forbid(unsafe_code)]
 
 use prime_core::merkle::{day_roots, DayRoot};
-use prime_core::{Currency, Hash, Ledger, LedgerError, RecordKind};
+use prime_core::{Currency, Hash, Ledger, LedgerError, Posting, RecordKind};
 use prime_store::{scan, StoreError};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::Path;
 
@@ -17,6 +17,8 @@ pub struct Report {
     pub records: u64,
     pub head_hash: Hash,
     pub accounts: usize,
+    /// Holds placed but not yet posted or voided.
+    pub pending_holds: usize,
     /// A half-written final record exists (a crash happened); not an integrity failure.
     pub torn_tail: bool,
     pub day_roots: Vec<DayRoot>,
@@ -80,6 +82,7 @@ pub fn verify_bytes(data: &[u8]) -> Result<Report, VerifyError> {
     // Independent recomputation of balances, straight from the postings.
     let mut currency_of: BTreeMap<&str, Currency> = BTreeMap::new();
     let mut balance_of: BTreeMap<&str, i64> = BTreeMap::new();
+    let mut held: HashMap<u64, &[Posting]> = HashMap::new();
     for rec in &sc.records {
         match &rec.kind {
             RecordKind::OpenAccount {
@@ -93,6 +96,18 @@ pub fn verify_bytes(data: &[u8]) -> Result<Report, VerifyError> {
                     *b = b.checked_add(p.amount).ok_or(VerifyError::Overflow)?;
                 }
             }
+            RecordKind::Hold { postings, .. } => {
+                held.insert(rec.seq, postings.as_slice());
+            }
+            RecordKind::Post { hold_seq } => {
+                if let Some(postings) = held.get(hold_seq) {
+                    for p in postings.iter() {
+                        let b = balance_of.entry(p.account.as_str()).or_insert(0);
+                        *b = b.checked_add(p.amount).ok_or(VerifyError::Overflow)?;
+                    }
+                }
+            }
+            RecordKind::Void { .. } | RecordKind::SetRules { .. } => {}
         }
     }
     let mut sums: BTreeMap<Currency, i64> = BTreeMap::new();
@@ -122,6 +137,7 @@ pub fn verify_bytes(data: &[u8]) -> Result<Report, VerifyError> {
         records: sc.records.len() as u64,
         head_hash: ledger.head_hash(),
         accounts: currency_of.len(),
+        pending_holds: ledger.pending_holds().len(),
         torn_tail: sc.torn_tail,
         day_roots: day_roots(&sc.records),
     })
@@ -211,5 +227,39 @@ mod tests {
         let rep_b = verify_bytes(&file_image(&recs)).unwrap();
         assert_ne!(rep_a.head_hash, rep_b.head_hash);
         assert_ne!(rep_a.day_roots, rep_b.day_roots);
+    }
+
+    #[test]
+    fn holds_and_rules_verify_and_pending_is_reported() {
+        let mut l = Ledger::new();
+        let gbp = Currency::parse("GBP").unwrap();
+        let p = |a: &str, n: i64| Posting { account: a.into(), amount: n };
+        let kinds = vec![
+            RecordKind::OpenAccount { account: "a".into(), currency: gbp, floor: None },
+            RecordKind::OpenAccount { account: "b".into(), currency: gbp, floor: None },
+            RecordKind::SetRules { version: 1, source: "require-memo\n".into() },
+            RecordKind::Hold {
+                idempotency_key: "h1".into(),
+                effective_ms: 0,
+                memo: "m".into(),
+                postings: vec![p("a", -5), p("b", 5)],
+            },
+            RecordKind::Hold {
+                idempotency_key: "h2".into(),
+                effective_ms: 0,
+                memo: "m".into(),
+                postings: vec![p("a", -2), p("b", 2)],
+            },
+            RecordKind::Post { hold_seq: 4 },
+        ];
+        let mut recs = Vec::new();
+        for k in kinds {
+            let r = l.next_record(10, k);
+            l.apply(&r).unwrap();
+            recs.push(r);
+        }
+        let rep = verify_bytes(&file_image(&recs)).unwrap();
+        assert_eq!(rep.records, 6);
+        assert_eq!(rep.pending_holds, 1);
     }
 }

@@ -7,8 +7,8 @@
 //! differ. Filtering on both answers "what did we believe on 3 March about 1 February?".
 //! Account openings follow recorded time only.
 use crate::ledger::LedgerError;
-use crate::record::{Currency, Record, RecordKind};
-use std::collections::BTreeMap;
+use crate::record::{Currency, Posting, Record, RecordKind};
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AsOf {
@@ -25,6 +25,8 @@ pub fn balances_as_of(
 ) -> Result<Vec<(String, Currency, i64)>, LedgerError> {
     let mut currency_of: BTreeMap<&str, Currency> = BTreeMap::new();
     let mut balance_of: BTreeMap<&str, i64> = BTreeMap::new();
+    // Holds only move balances once posted; they take effect at the hold's effective time.
+    let mut holds: HashMap<u64, (i64, &[Posting])> = HashMap::new();
     for r in records {
         if let Some(t) = asof.recorded_ms {
             if r.recorded_ms > t {
@@ -53,6 +55,27 @@ pub fn balances_as_of(
                     *b = b.checked_add(p.amount).ok_or(LedgerError::Overflow)?;
                 }
             }
+            RecordKind::Hold {
+                effective_ms,
+                postings,
+                ..
+            } => {
+                holds.insert(r.seq, (*effective_ms, postings.as_slice()));
+            }
+            RecordKind::Post { hold_seq } => {
+                if let Some((effective_ms, postings)) = holds.get(hold_seq) {
+                    if let Some(t) = asof.effective_ms {
+                        if *effective_ms > t {
+                            continue;
+                        }
+                    }
+                    for p in postings.iter() {
+                        let b = balance_of.entry(p.account.as_str()).or_insert(0);
+                        *b = b.checked_add(p.amount).ok_or(LedgerError::Overflow)?;
+                    }
+                }
+            }
+            RecordKind::Void { .. } | RecordKind::SetRules { .. } => {}
         }
     }
     Ok(currency_of
@@ -137,5 +160,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(b_of(&rows), 0);
+    }
+
+    #[test]
+    fn pending_and_voided_holds_do_not_count_posted_ones_do() {
+        let gbp = Currency::parse("GBP").unwrap();
+        let ps = |n: i64| {
+            vec![
+                Posting { account: "a".into(), amount: -n },
+                Posting { account: "b".into(), amount: n },
+            ]
+        };
+        let hold = |key: &str, n: i64| RecordKind::Hold {
+            idempotency_key: key.into(),
+            effective_ms: 500,
+            memo: String::new(),
+            postings: ps(n),
+        };
+        let kinds = vec![
+            (1000, RecordKind::OpenAccount { account: "a".into(), currency: gbp, floor: None }),
+            (1000, RecordKind::OpenAccount { account: "b".into(), currency: gbp, floor: None }),
+            (1000, hold("h1", 10)),
+            (1000, hold("h2", 20)),
+            (1000, hold("h3", 40)),
+            (2000, RecordKind::Post { hold_seq: 3 }),
+            (2000, RecordKind::Void { hold_seq: 4 }),
+        ];
+        let mut l = Ledger::new();
+        let mut recs = Vec::new();
+        for (t, k) in kinds {
+            let r = l.next_record(t, k);
+            l.apply(&r).unwrap();
+            recs.push(r);
+        }
+        let now = balances_as_of(&recs, AsOf::default()).unwrap();
+        assert_eq!(now[1], ("b".to_string(), gbp, 10));
+        // Before the post was recorded nothing had moved.
+        let before = balances_as_of(&recs, AsOf { recorded_ms: Some(1500), effective_ms: None }).unwrap();
+        assert_eq!(before[1].2, 0);
+        // The engine agrees with the replay.
+        assert_eq!(l.account("b"), Some((gbp, 10)));
     }
 }

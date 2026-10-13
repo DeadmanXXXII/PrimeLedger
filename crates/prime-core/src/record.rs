@@ -10,6 +10,7 @@ pub const MAX_ACCOUNT_LEN: usize = 64;
 pub const MAX_KEY_LEN: usize = 128;
 pub const MAX_MEMO_LEN: usize = 256;
 pub const MAX_POSTINGS: usize = 256;
+pub const MAX_RULES_LEN: usize = 16_384;
 
 /// Domain separator mixed into every record hash.
 pub const RECORD_DOMAIN: &[u8] = b"PRIMELEDGER/record/v1\0";
@@ -61,6 +62,20 @@ pub enum RecordKind {
         reverses: Option<u64>,
         postings: Vec<Posting>,
     },
+    /// Phase one of a two-phase movement: reserves outflows against account floors but does not
+    /// change any balance yet. Resolved by exactly one later `Post` or `Void`.
+    Hold {
+        idempotency_key: String,
+        effective_ms: i64,
+        memo: String,
+        postings: Vec<Posting>,
+    },
+    /// Settle a hold in full: its postings now take effect.
+    Post { hold_seq: u64 },
+    /// Release a hold: nothing is posted and the reservation is dropped.
+    Void { hold_seq: u64 },
+    /// Install a new rule set (see `rules`). `version` must be the previous version + 1.
+    SetRules { version: u32, source: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +84,28 @@ pub struct Record {
     pub prev_hash: Hash,
     pub recorded_ms: i64,
     pub kind: RecordKind,
+}
+
+fn encode_postings(e: &mut Encoder, postings: &[Posting]) {
+    e.u32(postings.len() as u32);
+    for p in postings {
+        e.str(&p.account);
+        e.i64(p.amount);
+    }
+}
+
+fn decode_postings(d: &mut Decoder<'_>) -> Result<Vec<Posting>, CodecError> {
+    let n = d.u32()? as usize;
+    if n > MAX_POSTINGS {
+        return Err(CodecError::TooLong);
+    }
+    let mut postings = Vec::with_capacity(n);
+    for _ in 0..n {
+        let account = d.string(MAX_ACCOUNT_LEN)?;
+        let amount = d.i64()?;
+        postings.push(Posting { account, amount });
+    }
+    Ok(postings)
 }
 
 impl Record {
@@ -112,11 +149,32 @@ impl Record {
                     }
                     None => e.u8(0),
                 }
-                e.u32(postings.len() as u32);
-                for p in postings {
-                    e.str(&p.account);
-                    e.i64(p.amount);
-                }
+                encode_postings(&mut e, postings);
+            }
+            RecordKind::Hold {
+                idempotency_key,
+                effective_ms,
+                memo,
+                postings,
+            } => {
+                e.u8(3);
+                e.str(idempotency_key);
+                e.i64(*effective_ms);
+                e.str(memo);
+                encode_postings(&mut e, postings);
+            }
+            RecordKind::Post { hold_seq } => {
+                e.u8(4);
+                e.u64(*hold_seq);
+            }
+            RecordKind::Void { hold_seq } => {
+                e.u8(5);
+                e.u64(*hold_seq);
+            }
+            RecordKind::SetRules { version, source } => {
+                e.u8(6);
+                e.u32(*version);
+                e.str(source);
             }
         }
         e.finish()
@@ -143,16 +201,7 @@ impl Record {
                 let effective_ms = d.i64()?;
                 let memo = d.string(MAX_MEMO_LEN)?;
                 let reverses = if d.flag()? { Some(d.u64()?) } else { None };
-                let n = d.u32()? as usize;
-                if n > MAX_POSTINGS {
-                    return Err(CodecError::TooLong);
-                }
-                let mut postings = Vec::with_capacity(n);
-                for _ in 0..n {
-                    let account = d.string(MAX_ACCOUNT_LEN)?;
-                    let amount = d.i64()?;
-                    postings.push(Posting { account, amount });
-                }
+                let postings = decode_postings(&mut d)?;
                 RecordKind::Transaction {
                     idempotency_key,
                     effective_ms,
@@ -160,6 +209,25 @@ impl Record {
                     reverses,
                     postings,
                 }
+            }
+            3 => {
+                let idempotency_key = d.string(MAX_KEY_LEN)?;
+                let effective_ms = d.i64()?;
+                let memo = d.string(MAX_MEMO_LEN)?;
+                let postings = decode_postings(&mut d)?;
+                RecordKind::Hold {
+                    idempotency_key,
+                    effective_ms,
+                    memo,
+                    postings,
+                }
+            }
+            4 => RecordKind::Post { hold_seq: d.u64()? },
+            5 => RecordKind::Void { hold_seq: d.u64()? },
+            6 => {
+                let version = d.u32()?;
+                let source = d.string(MAX_RULES_LEN)?;
+                RecordKind::SetRules { version, source }
             }
             t => return Err(CodecError::InvalidTag(t)),
         };
@@ -252,5 +320,27 @@ mod tests {
         assert!(Currency::parse("GBP").is_some());
         assert!(Currency::parse("gbp").is_none());
         assert!(Currency::parse("GBPX").is_none());
+    }
+
+    #[test]
+    fn new_kinds_roundtrip() {
+        let kinds = vec![
+            RecordKind::Hold {
+                idempotency_key: "h".into(),
+                effective_ms: 5,
+                memo: "m".into(),
+                postings: vec![
+                    Posting { account: "a".into(), amount: -1 },
+                    Posting { account: "b".into(), amount: 1 },
+                ],
+            },
+            RecordKind::Post { hold_seq: 7 },
+            RecordKind::Void { hold_seq: 8 },
+            RecordKind::SetRules { version: 2, source: "require-memo\n".into() },
+        ];
+        for k in kinds {
+            let r = Record { seq: 9, prev_hash: Hash::ZERO, recorded_ms: 1, kind: k };
+            assert_eq!(Record::decode(&r.encode()).unwrap(), r);
+        }
     }
 }

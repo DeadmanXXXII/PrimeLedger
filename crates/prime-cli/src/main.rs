@@ -2,7 +2,8 @@
 #![forbid(unsafe_code)]
 
 use prime_core::query::{self, AsOf};
-use prime_core::{fx, merkle};
+use prime_core::recon::{self, StatementLine};
+use prime_core::{events, fx, merkle};
 use prime_core::{Currency, Hash, Posting, Record, RecordKind};
 use prime_store::{Book, BookError};
 use prime_core::LedgerError;
@@ -16,6 +17,14 @@ USAGE:
   prime open-account <file> <ACCOUNT> <CUR> [--floor <minor-units<=0>]
   prime post         <file> <idempotency-key> <memo> <ACCOUNT=AMOUNT>...
   prime reverse      <file> <seq> <idempotency-key>
+  prime hold         <file> <idempotency-key> <memo> <ACCOUNT=AMOUNT>...
+  prime settle       <file> <hold-seq>
+  prime void         <file> <hold-seq>
+  prime holds        <file>
+  prime set-rules    <file> <rules-file>
+  prime rules        <file>
+  prime events       <file> [--after <seq>]
+  prime reconcile    <file> <ACCOUNT> <statement.csv> [--tolerance-days <n>] [--flip]
   prime balances     <file> [--recorded-at YYYY-MM-DD] [--effective-at YYYY-MM-DD]
   prime fx           <file> <key> <memo> <from> <fx-from> <fx-to> <to> <from-amt> <to-amt>
   prime snapshot     <file>
@@ -25,6 +34,8 @@ USAGE:
 
 Amounts are integer minor units (pence/cents). Positive = debit, negative = credit.
 Each transaction's postings must sum to zero per currency.
+A hold reserves outflows without moving balances; settle posts it, void releases it.
+Statement CSV lines: YYYY-MM-DD,amount,reference (amount signed from the account's view).
 Example:
   prime open-account my.pld equity GBP
   prime open-account my.pld cash GBP --floor 0
@@ -54,6 +65,14 @@ fn run(args: &[String]) -> Result<(), String> {
         "open-account" => cmd_open(rest),
         "post" => cmd_post(rest),
         "reverse" => cmd_reverse(rest),
+        "hold" => cmd_hold(rest),
+        "settle" => cmd_resolve(rest, true),
+        "void" => cmd_resolve(rest, false),
+        "holds" => cmd_holds(rest),
+        "set-rules" => cmd_set_rules(rest),
+        "rules" => cmd_rules(rest),
+        "events" => cmd_events(rest),
+        "reconcile" => cmd_reconcile(rest),
         "balances" => cmd_balances(rest),
         "fx" => cmd_fx(rest),
         "snapshot" => cmd_snapshot(rest),
@@ -117,24 +136,7 @@ fn parse_posting(s: &str) -> Result<Posting, String> {
     })
 }
 
-fn submit_tx(
-    book: &mut Book,
-    key: &str,
-    memo: &str,
-    reverses: Option<u64>,
-    postings: Vec<Posting>,
-) -> Result<(), String> {
-    let now = now_ms();
-    let result = book.submit(
-        RecordKind::Transaction {
-            idempotency_key: key.to_string(),
-            effective_ms: now,
-            memo: memo.to_string(),
-            reverses,
-            postings,
-        },
-        now,
-    );
+fn finish(result: Result<Record, BookError>) -> Result<(), String> {
     match result {
         Ok(rec) => {
             println!("#{} {}", rec.seq, rec.hash());
@@ -147,6 +149,26 @@ fn submit_tx(
         }
         Err(e) => Err(e.to_string()),
     }
+}
+
+fn submit_tx(
+    book: &mut Book,
+    key: &str,
+    memo: &str,
+    reverses: Option<u64>,
+    postings: Vec<Posting>,
+) -> Result<(), String> {
+    let now = now_ms();
+    finish(book.submit(
+        RecordKind::Transaction {
+            idempotency_key: key.to_string(),
+            effective_ms: now,
+            memo: memo.to_string(),
+            reverses,
+            postings,
+        },
+        now,
+    ))
 }
 
 fn cmd_post(a: &[String]) -> Result<(), String> {
@@ -299,6 +321,9 @@ fn cmd_verify(a: &[String]) -> Result<(), String> {
     let rep = prime_verify::verify_file(Path::new(&a[0])).map_err(|e| format!("VERIFY FAILED: {e}"))?;
     println!("OK: {} records, {} accounts", rep.records, rep.accounts);
     println!("head hash: {}", rep.head_hash);
+    if rep.pending_holds > 0 {
+        println!("pending holds: {}", rep.pending_holds);
+    }
     if rep.torn_tail {
         println!("warning: file ends with a half-written record (it will be removed on next open)");
     }
@@ -375,6 +400,227 @@ fn cmd_proof(a: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_hold(a: &[String]) -> Result<(), String> {
+    if a.len() < 5 {
+        return Err(usage());
+    }
+    let postings = a[3..]
+        .iter()
+        .map(|s| parse_posting(s))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut book = open_book(&a[0])?;
+    let now = now_ms();
+    finish(book.submit(
+        RecordKind::Hold {
+            idempotency_key: a[1].clone(),
+            effective_ms: now,
+            memo: a[2].clone(),
+            postings,
+        },
+        now,
+    ))
+}
+
+fn cmd_resolve(a: &[String], post: bool) -> Result<(), String> {
+    if a.len() != 2 {
+        return Err(usage());
+    }
+    let hold_seq: u64 = a[1].parse().map_err(|_| "hold-seq must be a number".to_string())?;
+    let mut book = open_book(&a[0])?;
+    let kind = if post {
+        RecordKind::Post { hold_seq }
+    } else {
+        RecordKind::Void { hold_seq }
+    };
+    finish(book.submit(kind, now_ms()))
+}
+
+fn cmd_holds(a: &[String]) -> Result<(), String> {
+    if a.len() != 1 {
+        return Err(usage());
+    }
+    let book = open_book(&a[0])?;
+    let pending = book.ledger().pending_holds();
+    if pending.is_empty() {
+        println!("no pending holds");
+    }
+    for (seq, postings) in pending {
+        println!("hold #{seq}");
+        for p in postings {
+            println!("  {:<32} {:>16}", p.account, p.amount);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_set_rules(a: &[String]) -> Result<(), String> {
+    if a.len() != 2 {
+        return Err(usage());
+    }
+    let source = std::fs::read_to_string(&a[1]).map_err(|e| format!("cannot read {}: {e}", a[1]))?;
+    let mut book = open_book(&a[0])?;
+    let version = book
+        .ledger()
+        .rules()
+        .version
+        .checked_add(1)
+        .ok_or("rules version overflow")?;
+    finish(book.submit(RecordKind::SetRules { version, source }, now_ms()))
+}
+
+fn cmd_rules(a: &[String]) -> Result<(), String> {
+    if a.len() != 1 {
+        return Err(usage());
+    }
+    let book = open_book(&a[0])?;
+    let rs = book.ledger().rules();
+    println!("rules version {} ({} rules)", rs.version, rs.rules.len());
+    if !rs.source.is_empty() {
+        println!("{}", rs.source.trim_end());
+    }
+    Ok(())
+}
+
+fn cmd_events(a: &[String]) -> Result<(), String> {
+    if a.is_empty() {
+        return Err(usage());
+    }
+    let mut after: u64 = 0;
+    let mut i = 1;
+    while i < a.len() {
+        match a[i].as_str() {
+            "--after" => {
+                let v = a.get(i + 1).ok_or("--after needs a sequence number")?;
+                after = v.parse().map_err(|_| "--after must be a number".to_string())?;
+                i += 2;
+            }
+            other => return Err(format!("unexpected argument '{other}'")),
+        }
+    }
+    prime_verify::verify_file(Path::new(&a[0])).map_err(|e| format!("VERIFY FAILED: {e}"))?;
+    let data = std::fs::read(&a[0]).map_err(|e| e.to_string())?;
+    let sc = prime_store::scan(&data).map_err(|e| e.to_string())?;
+    for r in sc.records.iter().filter(|r| r.seq > after) {
+        println!("{}", events::record_to_json(r));
+    }
+    Ok(())
+}
+
+fn parse_date_day(s: &str) -> Result<i64, String> {
+    Ok(parse_date_end_ms(s)?.div_euclid(merkle::MS_PER_DAY))
+}
+
+fn parse_statement(text: &str, flip: bool) -> Result<Vec<StatementLine>, String> {
+    let mut out = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line_no = i + 1;
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.splitn(3, ',');
+        let date = parts.next().unwrap_or("").trim();
+        if line_no == 1 && date.eq_ignore_ascii_case("date") {
+            continue;
+        }
+        let amount = parts
+            .next()
+            .ok_or_else(|| format!("statement line {line_no}: expected date,amount,reference"))?
+            .trim();
+        let reference = parts.next().unwrap_or("").trim().to_string();
+        let day = parse_date_day(date).map_err(|e| format!("statement line {line_no}: {e}"))?;
+        let mut amount: i64 = amount
+            .parse()
+            .map_err(|_| format!("statement line {line_no}: amount must be an integer of minor units"))?;
+        if flip {
+            amount = amount
+                .checked_neg()
+                .ok_or_else(|| format!("statement line {line_no}: amount overflow"))?;
+        }
+        out.push(StatementLine {
+            line_no,
+            day,
+            amount,
+            reference,
+        });
+    }
+    Ok(out)
+}
+
+fn fmt_day(day: i64) -> String {
+    let (y, m, d) = civil_from_days(day);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn cmd_reconcile(a: &[String]) -> Result<(), String> {
+    if a.len() < 3 {
+        return Err(usage());
+    }
+    let mut tolerance: i64 = 3;
+    let mut flip = false;
+    let mut i = 3;
+    while i < a.len() {
+        match a[i].as_str() {
+            "--tolerance-days" => {
+                let v = a.get(i + 1).ok_or("--tolerance-days needs a number")?;
+                tolerance = v.parse().map_err(|_| "--tolerance-days must be a number".to_string())?;
+                if tolerance < 0 {
+                    return Err("--tolerance-days must not be negative".into());
+                }
+                i += 2;
+            }
+            "--flip" => {
+                flip = true;
+                i += 1;
+            }
+            other => return Err(format!("unexpected argument '{other}'")),
+        }
+    }
+    prime_verify::verify_file(Path::new(&a[0])).map_err(|e| format!("VERIFY FAILED: {e}"))?;
+    let data = std::fs::read(&a[0]).map_err(|e| e.to_string())?;
+    let sc = prime_store::scan(&data).map_err(|e| e.to_string())?;
+    let known = sc.records.iter().any(|r| {
+        matches!(&r.kind, RecordKind::OpenAccount { account, .. } if account == &a[1])
+    });
+    if !known {
+        return Err(format!("unknown account '{}'", a[1]));
+    }
+    let text = std::fs::read_to_string(&a[2]).map_err(|e| format!("cannot read {}: {e}", a[2]))?;
+    let statement = parse_statement(&text, flip)?;
+    let entries = recon::account_entries(&sc.records, &a[1]);
+    let r = recon::reconcile(&statement, &entries, tolerance);
+    println!(
+        "matched {}, statement-only {}, ledger-only {}",
+        r.matched.len(),
+        r.unmatched_statement.len(),
+        r.unmatched_ledger.len()
+    );
+    for l in &r.unmatched_statement {
+        println!(
+            "  NOT IN LEDGER   line {:>4}  {}  {:>14}  {}",
+            l.line_no,
+            fmt_day(l.day),
+            l.amount,
+            l.reference
+        );
+    }
+    for e in &r.unmatched_ledger {
+        println!(
+            "  NOT ON STATEMENT  #{:<6}  {}  {:>14}  {}",
+            e.seq,
+            fmt_day(e.day),
+            e.amount,
+            e.memo
+        );
+    }
+    if r.unmatched_statement.is_empty() && r.unmatched_ledger.is_empty() {
+        println!("RECONCILED");
+    } else {
+        println!("BREAKS FOUND");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{civil_from_days, days_from_civil, parse_date_end_ms};
@@ -406,5 +652,18 @@ mod tests {
         assert_eq!((p.account.as_str(), p.amount), ("acct:x", -250));
         assert!(super::parse_posting("nope").is_err());
         assert!(super::parse_posting("a=1.5").is_err());
+    }
+
+    #[test]
+    fn statement_parser() {
+        let txt = "date,amount,reference\n2024-01-01,500,pay\n\n# note\n2024-01-02,-70,fee, with comma\n";
+        let v = super::parse_statement(txt, false).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!((v[0].day, v[0].amount), (19_723, 500));
+        assert_eq!(v[1].reference, "fee, with comma");
+        let f = super::parse_statement(txt, true).unwrap();
+        assert_eq!(f[0].amount, -500);
+        assert!(super::parse_statement("2024-01-01,abc,x", false).is_err());
+        assert!(super::parse_statement("2024-01-01", false).is_err());
     }
 }

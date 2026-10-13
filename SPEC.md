@@ -44,6 +44,27 @@ open. Damage anywhere else is a hard error. Appends are fsynced before returning
 - reversal: targets an existing, not-yet-reversed, non-reversal transaction; postings are its exact
   negation; reversals bypass floors so mistakes can always be corrected
 
+## Holds (two-phase movements)
+
+Record tags 3-5: `Hold` (same fields as a transaction minus `reverses`), `Post{hold_seq}`, `Void{hold_seq}`.
+A hold checks the same invariants as a transaction and reserves each account's outflows against its
+floor, but changes no balance. It is resolved by exactly one later `Post` (postings take effect, and
+the post is reversible like any transaction) or `Void` (reservation released). Spending is checked
+against balance minus reserved funds. Settling or voiding bypasses rules and floors: it was already
+authorised. Hold keys share the idempotency namespace with transactions.
+
+## Rules
+
+Record tag 6: `SetRules{version, source}`; `version` must be the previous version + 1 (first is 1).
+Rules are a line-based language (see `prime_core::rules`) hashed into the chain, so every change is
+auditable. They apply to new transactions and holds; reversals, `Post` and `Void` bypass them.
+
+## Outbox and reconciliation
+
+`prime events --after <seq>` prints one JSON object per record (`prime_core::events`); consumers
+remember the last seq handled. `prime reconcile` matches a statement CSV against one account
+(`prime_core::recon`); posted holds count on their effective date, pending and voided ones never do.
+
 ## Merkle day roots
 
 Leaves are record hashes grouped by UTC day of `recorded_ms`.
@@ -66,8 +87,8 @@ each currency still sums to zero. See `prime_core::fx::exchange`.
 
 ## Snapshot (`<ledger file>.snap`, cache only)
 
-    "PRIMESNAP1" | body | SHA-256("PRIMESNAP1" || body)
-    body: u64 seq | [32] head_hash | i64 last_ms | accounts | idempotency keys | transactions
+    "PRIMESNAP2" | body | SHA-256("PRIMESNAP2" || body)
+    body: u64 seq | [32] head_hash | i64 last_ms | accounts (with reserved) | idempotency keys | transactions | holds | rules
 
 Deterministic: the same state yields the same bytes. On open, a snapshot is used only if the log's
 record at `seq` hashes to `head_hash`; the remaining records are replayed through the normal rules.
